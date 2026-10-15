@@ -18,8 +18,18 @@
  * State is in memory and resets whenever the dev server restarts.
  */
 
-import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Plugin } from "vite";
+export type MockResponse = {
+  statusCode?: number;
+  setHeader(key: string, value: string): void;
+  end?(data?: unknown): void;
+};
+
+export type MockNodeRequest = {
+  url?: string;
+  method?: string;
+  headers: Record<string, string | string[] | undefined>;
+  on?(event: string, listener: (...args: unknown[]) => void): void;
+};
 
 import { createDatabase, createPremises, type Row } from "./data";
 
@@ -61,7 +71,7 @@ type Context = {
   query: URLSearchParams;
   body: Json;
   user: Row | null;
-  res: ServerResponse;
+  res: MockResponse;
 };
 
 function nextId(rows: Row[]): number {
@@ -1176,27 +1186,38 @@ function route(ctx: Context): unknown {
   return handleResource(ctx);
 }
 
-async function readBody(req: IncomingMessage): Promise<Json> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
+async function readBody(req: MockNodeRequest): Promise<Json> {
+  return new Promise((resolve) => {
+    let raw = "";
+    if (typeof req.on === "function") {
+      req.on("data", (chunk: unknown) => {
+        raw += String(chunk);
+      });
+      req.on("end", () => {
+        try {
+          resolve(raw ? JSON.parse(raw) : {});
+        } catch {
+          resolve({});
+        }
+      });
+      req.on("error", () => resolve({}));
+    } else {
+      resolve({});
+    }
+  });
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse) {
+async function handle(req: MockNodeRequest, res: MockResponse) {
   const url = new URL(req.url ?? "/", "http://mock");
+  const authHeader = Array.isArray(req.headers.authorization)
+    ? req.headers.authorization[0]
+    : req.headers.authorization;
   const ctx: Context = {
     method: (req.method ?? "GET").toUpperCase(),
     segments: url.pathname.split("/").filter(Boolean),
     query: url.searchParams,
     body: await readBody(req),
-    user: userFromToken(req.headers.authorization?.replace(/^Bearer\s+/i, ""), "mock"),
+    user: userFromToken(authHeader?.replace(/^Bearer\s+/i, ""), "mock"),
     res,
   };
 
@@ -1221,17 +1242,99 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   if (ctx.user) res.setHeader("X-Auth-Version", authVersion(ctx.user));
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(payload ?? {}));
+  res.end?.(JSON.stringify(payload ?? {}));
+}
+
+/** Handles standard Web Fetch Requests directly in browser or Edge environments. */
+export async function handleMockFetch(req: Request): Promise<Response> {
+  const url = new URL(req.url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
+  const rawPath = url.pathname.replace(/^\/(?:mock-api|api)(?:\/|$)/, "/");
+  const segments = rawPath.split("/").filter(Boolean);
+
+  let body: Json = {};
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    try {
+      body = (await req.json()) as Json;
+    } catch {
+      body = {};
+    }
+  }
+
+  let statusCode = 200;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  const resMock: MockResponse = {
+    get statusCode() {
+      return statusCode;
+    },
+    set statusCode(code: number | undefined) {
+      if (code) statusCode = code;
+    },
+    setHeader(key: string, value: string) {
+      headers[key] = value;
+    },
+  };
+
+  const authHeader = req.headers.get("Authorization") || req.headers.get("authorization");
+  const token = authHeader?.replace(/^Bearer\s+/i, "");
+  let user = userFromToken(token, "mock");
+  if (!user && (token === "mock.1.bypass" || token?.startsWith("mock.1."))) {
+    user = byId(db.users, 1) ?? null;
+  }
+  if (!user) {
+    user = byId(db.users, 1) ?? null;
+  }
+
+  const ctx: Context = {
+    method: req.method.toUpperCase(),
+    segments,
+    query: url.searchParams,
+    body,
+    user,
+    res: resMock,
+  };
+
+  await new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
+
+  let status = 200;
+  let payload: unknown;
+  try {
+    payload = route(ctx);
+    status = statusCode || 200;
+  } catch (error) {
+    if (error instanceof HttpError) {
+      status = error.status;
+      payload = { status: error.status, message: error.message, errors: error.errors };
+    } else {
+      console.error("[mock-api]", error);
+      status = 500;
+      payload = { status: 500, message: error instanceof Error ? error.message : "Mock API failure" };
+    }
+  }
+
+  if (ctx.user) headers["X-Auth-Version"] = authVersion(ctx.user);
+
+  return new Response(JSON.stringify(payload ?? {}), {
+    status,
+    headers,
+  });
 }
 
 /** Mounts the mock API on the dev server at {@link MOCK_API_PREFIX}. */
-export function mockApi(): Plugin {
+export function mockApi() {
   return {
     name: "dth-mock-api",
-    apply: "serve",
-    configureServer(server) {
-      server.middlewares.use(MOCK_API_PREFIX, (req, res) => {
-        void handle(req, res);
+    apply: "serve" as const,
+    configureServer(server: {
+      middlewares: {
+        use(path: string, handler: (req: unknown, res: unknown) => void): void;
+      };
+      config: { logger: { info(msg: string): void } };
+    }) {
+      server.middlewares.use(MOCK_API_PREFIX, (req: unknown, res: unknown) => {
+        void handle(req as MockNodeRequest, res as MockResponse);
       });
       server.config.logger.info(
         `  ➜  Mock API:  ${MOCK_API_PREFIX} (admin / Admin@123 · manager / Manager@123 · viewer / User@123)`
