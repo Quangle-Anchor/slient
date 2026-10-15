@@ -45,7 +45,7 @@ import {
   RowLevelPolicyEdit,
   RowLevelPolicyShow,
 } from "@/features/administration";
-import { Login, Profile } from "@/features/identity";
+import { Profile } from "@/features/identity";
 import { ErrorComponent } from "@/shared/components/layout/error-component";
 import { Forbidden } from "@/shared/components/layout/forbidden";
 import { Layout } from "@/shared/components/layout/layout";
@@ -271,20 +271,8 @@ export function AppRoutes() {
         <Route path="*" element={<ErrorComponent />} />
       </Route>
 
-      {/*
-        The unauthenticated half. `fallback` is what renders when there is no
-        session; a signed-in visitor is sent to the dashboard instead, so the
-        login URL never shows a form to someone who is already past it.
-      */}
-      <Route
-        element={
-          <Authenticated key="unauthenticated-routes" fallback={<Outlet />}>
-            <Navigate to="/" replace />
-          </Authenticated>
-        }
-      >
-        <Route path="/login" element={<Login />} />
-      </Route>
+      {/* Login is bypassed — redirect to dashboard */}
+      <Route path="/login" element={<Navigate to="/dashboard" replace />} />
     </Routes>
   );
 }
